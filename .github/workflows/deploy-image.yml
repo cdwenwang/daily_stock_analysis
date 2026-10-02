@@ -1,0 +1,93 @@
+name: Build Deploy Image
+
+# fork 专用：main 分支更新后构建「你自己的」部署镜像并推送到 GHCR。
+# 与仓库自带的 docker-publish.yml（官方发版，v*.*.* tag 触发）互不干扰。
+#
+# 前置条件（fork 不会自动开启，需要手动设置一次）：
+#   Settings → Actions → General → Workflow permissions
+#   选 "Read and write permissions"，否则 GITHUB_TOKEN 没有 packages:write 权限。
+#
+# 首次推送后如需在 ECS 上匿名拉取，把包可见性改为 Public：
+#   https://github.com/users/cdwenwang/packages/container/daily_stock_analysis/settings
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+      - 'deploy/**'
+      - '.github/workflows/deploy-image.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile
+          # ECS 是 ARM 实例（阿里云倚天 / 腾讯云 ARM）时改成 linux/amd64,linux/arm64，
+          # 同时上面的 buildx 步骤需要 docker/setup-qemu-action@v3。
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:prod
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 直接拉取刚推送的镜像做导入冒烟，确保 ECS 上拉到的东西真的能跑起来。
+      # 用 heredoc 而非 python -c "多行"，避免缩进被当成 IndentationError。
+      - name: Smoke test pushed image
+        run: |
+          docker run --rm -i --entrypoint python "${{ env.IMAGE }}:sha-${{ github.sha }}" - <<'PY'
+          from src.config import get_config
+          print('ok-config')
+          from src.storage import DatabaseManager
+          print('ok-storage')
+          from src.notification import NotificationService
+          print('ok-notification')
+          from data_provider import DataFetcherManager
+          print('ok-data-provider')
+          from src.analyzer import GeminiAnalyzer
+          print('ok-analyzer')
+          print('smoke-ok')
+          PY
+
+      - name: Summary
+        run: |
+          {
+            echo "### 部署镜像已发布"
+            echo ""
+            echo "- \`${{ env.IMAGE }}:prod\`"
+            echo "- \`${{ env.IMAGE }}:sha-${{ github.sha }}\`"
+            echo ""
+            echo "ECS 上线：\`dsa-up\`"
+            echo "回滚到本版本：把 deploy/docker-compose.prod.yml 的 tag 改成 \`:sha-${{ github.sha }}\` 后重新 \`dsa-up\`"
+          } >> "$GITHUB_STEP_SUMMARY"

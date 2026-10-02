@@ -1,0 +1,29 @@
+# ===================================
+# 生产部署覆盖文件（fork 自用）
+# ===================================
+#
+# 与仓库自带的 docker/docker-compose.yml 叠加使用，只覆盖镜像来源与少量运行时配置。
+# volumes / env_file / logging / 资源限制全部继承上游文件，便于跟随 upstream 更新，
+# 也让「ECS 上永远不编译代码」这条规则得以成立。
+#
+# 常用命令（在仓库根目录执行）：
+#   上线/更新： docker compose -f docker/docker-compose.yml -f deploy/docker-compose.prod.yml up -d --no-build
+#   查看日志： docker compose -f docker/docker-compose.yml -f deploy/docker-compose.prod.yml logs -f --tail=100
+#   查看状态： docker compose -f docker/docker-compose.yml -f deploy/docker-compose.prod.yml ps
+#
+# 回滚：把下面 x-deploy-image 的 :prod 改成目标版本的 :sha-<commit>，重跑上线命令即可。
+
+x-deploy-image: &deploy_image ghcr.io/cdwenwang/daily_stock_analysis:prod
+
+services:
+  analyzer:
+    image: *deploy_image
+    environment:
+      # 让 WebUI 里保存的配置（自选股 / 定时设置）落到 data 卷，容器重建后不丢。
+      # 详见 docs/deploy-webui-cloud.md。其余键仍以宿主机 .env 为准。
+      - ENV_FILE=/app/data/runtime.env
+
+  server:
+    image: *deploy_image
+    environment:
+      - ENV_FILE=/app/data/runtime.env
