@@ -37,8 +37,8 @@ git push ─────────────────────► PR �
                                 └── deploy/docker-compose.prod.yml
                                         │
                                         ▼
-                                容器: stock-analyzer (--schedule)
-                                      stock-server   (--serve-only)
+                                容器: stock-server (--serve-only)
+                                      ← 单容器同时承担 Web 与定时分析，见 §3.5
                                         │
                                         ▼
                                 Nginx :80/:443 ──► 你的域名
@@ -121,29 +121,55 @@ echo '<你的PAT>' | docker login ghcr.io -u cdwenwang --password-stdin
 登录信息存在 `~/.docker/config.json`，**这个文件已包含在备份脚本的考虑范围内**（见第 6 节说明），
 重建时若忘了密码可直接重新登录。
 
-### 3.5 设置上线命令别名
+### 3.5 选择容器拓扑（重要，先看这段）
+
+compose 里定义了两个服务，**不要无脑全起**：
+
+| 服务 | 启动命令 | 作用 |
+| --- | --- | --- |
+| `analyzer` | `main.py --schedule` | 纯 CLI 调度循环 |
+| `server` | `main.py --serve-only` | FastAPI + Web 界面；`SCHEDULE_ENABLED=true` 时**同时**接管定时分析 |
+
+两个调度器之间**没有跨进程互斥**：`src/services/runtime_scheduler.py` 用的运行锁
+`_RUNTIME_ANALYSIS_LOCK` 是进程内的线程锁，而 `main.py` 判断是否启动运行时调度器的
+条件是 `args.schedule or config.schedule_enabled`（即受 `.env` 里的 `SCHEDULE_ENABLED` 影响）。
+所以：
+
+| 配置 | 结果 |
+| --- | --- |
+| `SCHEDULE_ENABLED=false`（上游默认）+ 两个服务同起 | ✅ analyzer 调度，server 只做 Web |
+| **`SCHEDULE_ENABLED=true` + 两个服务同起** | ❌ **到点分析两次、推送两遍** |
+| `SCHEDULE_ENABLED=true` + **只起 `server`** | ✅ 一个进程同时管 Web 和调度 |
+
+**推荐只起 `server`**：少一个容器、内存占用减半，且不会重复推送。
+只有把 `SCHEDULE_ENABLED` 保持为 `false` 时才有必要单独起 `analyzer`。
+
+### 3.6 设置上线命令别名
 
 ```bash
 sudo tee /usr/local/bin/dsa-up >/dev/null <<'SH'
 #!/usr/bin/env bash
+# 默认只管理 server；需要操作别的服务时：dsa-up analyzer
 set -euo pipefail
 cd /opt/stock-analyzer
 COMPOSE=(-f docker/docker-compose.yml -f deploy/docker-compose.prod.yml)
-docker compose "${COMPOSE[@]}" pull
-docker compose "${COMPOSE[@]}" up -d --no-build
+SERVICES=("$@")
+[ ${#SERVICES[@]} -eq 0 ] && SERVICES=(server)
+docker compose "${COMPOSE[@]}" pull "${SERVICES[@]}"
+docker compose "${COMPOSE[@]}" up -d --no-build "${SERVICES[@]}"
 docker compose "${COMPOSE[@]}" ps
 SH
 sudo chmod +x /usr/local/bin/dsa-up
 ```
 
-### 3.6 启动
+### 3.7 启动
 
 ```bash
-dsa-up
+dsa-up                                  # 只起 server（Web + 定时分析）
 curl -fsS http://127.0.0.1:8000/api/health && echo OK
 ```
 
-### 3.7 Nginx + 域名 + HTTPS
+### 3.8 Nginx + 域名 + HTTPS
 
 ```bash
 sudo apt update && sudo apt install -y nginx certbot python3-certbot-nginx
@@ -155,13 +181,13 @@ sudo certbot --nginx -d 你的域名        # 自动申请证书 + 配置自动�
 
 DNS 记得提前把域名的 A 记录指向 ECS 公网 IP，证书签发才能通过校验。
 
-### 3.8 验证清单
+### 3.9 验证清单
 
 - [ ] `curl http://127.0.0.1:8000/api/health` 返回正常
 - [ ] 浏览器打开 `https://你的域名`，出现登录/初始化密码页面
 - [ ] 首次访问设置管理密码（`ADMIN_AUTH_ENABLED=true` 生效）
 - [ ] 手动跑一次分析，确认通知能收到：
-      `docker compose -f docker/docker-compose.yml -f deploy/docker-compose.prod.yml exec -u dsa stock-analyzer python main.py --no-notify`
+      `docker compose -f docker/docker-compose.yml -f deploy/docker-compose.prod.yml exec -u dsa stock-server python main.py --no-notify`
 - [ ] 去掉 `--no-notify` 再跑一次，确认飞书/企业微信收到推送
 
 ---
@@ -307,11 +333,14 @@ sudo certbot --nginx -d 你的域名
 # ⑦ 重建上线别名
 sudo tee /usr/local/bin/dsa-up >/dev/null <<'SH'
 #!/usr/bin/env bash
+# 默认只管理 server；需要操作别的服务时：dsa-up analyzer
 set -euo pipefail
 cd /opt/stock-analyzer
 COMPOSE=(-f docker/docker-compose.yml -f deploy/docker-compose.prod.yml)
-docker compose "${COMPOSE[@]}" pull
-docker compose "${COMPOSE[@]}" up -d --no-build
+SERVICES=("$@")
+[ ${#SERVICES[@]} -eq 0 ] && SERVICES=(server)
+docker compose "${COMPOSE[@]}" pull "${SERVICES[@]}"
+docker compose "${COMPOSE[@]}" up -d --no-build "${SERVICES[@]}"
 docker compose "${COMPOSE[@]}" ps
 SH
 sudo chmod +x /usr/local/bin/dsa-up
@@ -338,14 +367,14 @@ curl -fsS http://127.0.0.1:8000/api/health && echo OK
 dsa-up
 docker compose -f docker/docker-compose.yml -f deploy/docker-compose.prod.yml logs -f --tail=100
 
-# 进容器
-docker compose -f docker/docker-compose.yml -f deploy/docker-compose.prod.yml exec -u dsa stock-analyzer bash
+# 进容器（只跑 server 时容器名是 stock-server；跑 analyzer 时才是 stock-analyzer）
+docker compose -f docker/docker-compose.yml -f deploy/docker-compose.prod.yml exec -u dsa stock-server bash
 
 # 手动跑一次分析（不发通知）
-docker compose -f docker/docker-compose.yml -f deploy/docker-compose.prod.yml exec -u dsa stock-analyzer python main.py --no-notify
+docker compose -f docker/docker-compose.yml -f deploy/docker-compose.prod.yml exec -u dsa stock-server python main.py --no-notify
 
 # 忘记 Web 管理密码
-docker compose -f docker/docker-compose.yml -f deploy/docker-compose.prod.yml exec -u dsa stock-analyzer python -m src.auth reset_password
+docker compose -f docker/docker-compose.yml -f deploy/docker-compose.prod.yml exec -u dsa stock-server python -m src.auth reset_password
 
 # 页面能打开但样式错乱（静态资源 404）
 # → 镜像里前端没打包好，重新触发 Actions 构建，然后 dsa-up
