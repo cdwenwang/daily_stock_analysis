@@ -20,16 +20,20 @@ git push ─────────────────────► PR �
                                         │
                                         ▼
                                 Actions: deploy-image.yml
-                                构建镜像并推送
+                                构建镜像并推送（一份构建，推两个 registry）
                                         │
-                                        ▼
-                                GHCR: ghcr.io/cdwenwang/
-                                      daily_stock_analysis
-                                      ├── :prod          ← 最新
-                                      └── :sha-<commit>  ← 回滚锚点
-                                        │
-                                        │  docker compose pull
-                                        ▼
+                          ┌─────────────┴──────────────┐
+                          ▼                            ▼
+                 阿里云 ACR（ECS 从这里拉）      GHCR（仅留后路）
+                 crpi-u3rv49hccjew63jz          ghcr.io/cdwenwang/
+                   -vpc.cn-beijing.personal        daily_stock_analysis
+                   .cr.aliyuncs.com                 国内拉不动，勿用
+                   /default-is/stock-analysis
+                     ├── :prod          ← 最新
+                     └── :sha-<commit>  ← 回滚锚点
+                          │
+                          │  docker compose pull（走 VPC 内网，所以快）
+                          ▼
                                 /opt/stock-analyzer/
                                 ├── .env           ← 唯一真源，已 gitignore
                                 ├── data/          ← SQLite + runtime.env
@@ -47,8 +51,10 @@ git push ─────────────────────► PR �
 核心原则：
 
 - **ECS 上永远不编译代码**，只拉镜像。
-- **代码和镜像不需要备份**（GitHub / GHCR 就是备份）。
+- **代码和镜像不需要备份**（GitHub 存代码、阿里云 ACR 存镜像，本身就是备份）。
 - **只有 `.env` + `data/` 需要备份**，这决定了灾备恢复的速度。
+- **镜像必须走 ACR，不能走 GHCR**：GHCR 的 blob 托管在 `*.githubusercontent.com`，
+  国内 ECS 能建立 TCP 连接但收不到任何字节，`docker pull` 会永久挂起（实测确认）。
 
 ---
 
@@ -66,11 +72,16 @@ git push ─────────────────────► PR �
 
    保留：`CI`（PR 时跑测试）、`00-daily-analysis.yml`（备用）、`Build Deploy Image`（本 fork 的部署构建）。
 
-3. **首次构建后设置包可见性**
-   触发一次构建（对 main 任意 push，或 Actions 页面手动 `Run workflow`），然后到
-   `https://github.com/users/cdwenwang/packages/container/daily_stock_analysis/settings`
-   把可见性设为 **Public**。
-   不想公开也可以，那样 ECS 上需要 `docker login ghcr.io`（见 3.4）。
+3. **添加 ACR 凭据到 Repository secrets**（构建时推送镜像到阿里云 ACR 用）
+   `Settings → Secrets and variables → Actions` → New repository secret：
+
+   | Name | 值 |
+   | --- | --- |
+   | `ACR_USERNAME` | 阿里云账号全名，如 `1179574672@qq.com` |
+   | `ACR_PASSWORD` | ACR 控制台「访问凭证」页设置的固定密码 |
+
+   registry 地址和镜像路径不是机密，直接写在 `deploy-image.yml` 里，
+   这样即使 fork 被改动也不会把镜像推到别处去。
 
 ### 2.2 ECS 侧规格
 
@@ -111,15 +122,21 @@ vim .env          # 按模板注释填写：自选股 + 至少一个模型 key +
 
 `.env` 已经在仓库 `.gitignore`（第 2 行）里，不会被 `git pull` 覆盖或误提交。
 
-### 3.4 登录镜像仓库（仅当包设为 private 时需要）
+### 3.4 登录阿里云 ACR（私有仓库，必须做一次）
+
+ACR 上的 `default-is/stock-analysis` 是私有仓库，ECS 拉取前必须登录：
 
 ```bash
-# 在 GitHub 生成 PAT，勾选 read:packages
-echo '<你的PAT>' | docker login ghcr.io -u cdwenwang --password-stdin
+# 用户名是阿里云账号全名，密码是 ACR 控制台「访问凭证」页设置的固定密码
+echo '<ACR固定密码>' | docker login \
+  --username '1179574672@qq.com' --password-stdin \
+  crpi-u3rv49hccjew63jz-vpc.cn-beijing.personal.cr.aliyuncs.com
 ```
 
-登录信息存在 `~/.docker/config.json`，**这个文件已包含在备份脚本的考虑范围内**（见第 6 节说明），
-重建时若忘了密码可直接重新登录。
+注意用 **VPC 端点**（带 `-vpc`）——它解析到 `100.x.x.x` 的内网地址，走阿里云内网，
+不消耗你那 3 Mbps 公网带宽。
+
+登录信息存在 `~/.docker/config.json`，**这个文件要纳入备份**，否则重建后又要重新登录一次。
 
 ### 3.5 选择容器拓扑（重要，先看这段）
 
@@ -209,14 +226,21 @@ git push origin feat/xxx
 > `ci.yml` 只在 **pull_request** 时触发，直接 push 到 main 不会跑测试。
 > 所以务必走 PR，哪怕是在自己的 fork 里。
 
-PR 合并到 main 后，`Build Deploy Image` 自动构建并推送镜像（约 5-10 分钟，有 gha 缓存会更快）。
-构建完成后再上线：
+PR 合并到 main 后，`Build Deploy Image` 自动构建并推送镜像到 GHCR + 阿里云 ACR
+（约 5-15 分钟；ACR 那一份是跨境推送，比 GHCR 慢）。构建完成后再上线：
 
 ```bash
-ssh <你的ECS>
-dsa-up                                  # 约 30 秒
-docker compose -f docker/docker-compose.yml -f deploy/docker-compose.prod.yml logs -f --tail=100
+ssh dsa          # 或 ssh root@10.0.0.1（走 WireGuard 隧道）
+dsa-up           # 约 30 秒，含自动健康检查
 ```
+
+三个预装好的辅助命令：
+
+| 命令 | 用途 |
+| --- | --- |
+| `dsa-up` | 拉取 + 部署 + 健康检查（默认只管理 `server` 服务） |
+| `dsa-logs` | 实时日志，`dsa-logs 200` 看最近 200 行 |
+| `dsa-status` | 一眼看容器 / 后端 / 内存 / 磁盘 / WireGuard |
 
 ### 4.2 回滚
 
@@ -255,7 +279,7 @@ git push origin main                    # 触发构建 → dsa-up
 | 内容 | 位置 | 需要备份 |
 | --- | --- | --- |
 | 代码 | GitHub | 否 |
-| 镜像 | GHCR | 否 |
+| 镜像 | 阿里云 ACR | 否 |
 | **`.env`** | ECS | **必须**（丢了要重新申请所有 key） |
 | **`data/`** | ECS | **必须**（数据库、历史记录、WebUI 保存的配置） |
 | **nginx 配置** | ECS | **必须**（重建时省 3 分钟） |
@@ -310,15 +334,20 @@ curl -fsSL https://get.docker.com | sh
 sudo usermod -aG docker $USER && exec su -l $USER
 
 # ② 拉代码（30 秒）
+#    注意：GitHub 的 git 协议在国内被拒（Empty reply from server），必须走 codeload tarball
 sudo mkdir -p /opt/stock-analyzer && sudo chown "$USER" /opt/stock-analyzer
-git clone https://github.com/cdwenwang/daily_stock_analysis.git /opt/stock-analyzer
+curl -fsSL -o /tmp/dsa.tar.gz \
+  https://codeload.github.com/cdwenwang/daily_stock_analysis/tar.gz/refs/heads/main
+mkdir -p /tmp/dsa-src && tar xzf /tmp/dsa.tar.gz -C /tmp/dsa-src
+cd /tmp/dsa-src/daily_stock_analysis-main && tar cf - . | (cd /opt/stock-analyzer && tar xf -)
 cd /opt/stock-analyzer && chmod +x deploy/*.sh
 
 # ③ 取回备份（1 分钟）—— 从 rclone / 对象存储控制台下载最新归档
 rclone copy oss:my-bucket/dsa-backup/dsa-<最新>.tar.gz /var/backups/dsa/
 
-# ④ 登录镜像仓库（仅 private 包需要，30 秒）
-echo '<你的PAT>' | docker login ghcr.io -u cdwenwang --password-stdin
+# ④ 登录阿里云 ACR（30 秒）
+echo '<ACR固定密码>' | docker login --username '1179574672@qq.com' --password-stdin \
+  crpi-u3rv49hccjew63jz-vpc.cn-beijing.personal.cr.aliyuncs.com
 
 # ⑤ 恢复并拉起（1 分钟）
 ./deploy/restore.sh /var/backups/dsa/dsa-<最新>.tar.gz
