@@ -80,6 +80,11 @@ jobs:
             ${{ env.IMAGE }}:sha-${{ github.sha }}
             ${{ env.ACR_IMAGE }}:prod
             ${{ env.ACR_IMAGE }}:sha-${{ github.sha }}
+          # 必须关掉：buildx 默认会额外生成 provenance/SBOM 证明清单（mediaType
+          # application/vnd.oci.empty.v1+json），GHCR 接受，但阿里云 ACR 个人版会拒绝，
+          # 报 "denied: unknown manifest class for application/vnd.oci.empty.v1+json"。
+          provenance: false
+          sbom: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
