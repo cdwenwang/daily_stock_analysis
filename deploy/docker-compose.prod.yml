@@ -12,8 +12,12 @@
 #   查看状态： docker compose -f docker/docker-compose.yml -f deploy/docker-compose.prod.yml ps
 #
 # 回滚：把下面 x-deploy-image 的 :prod 改成目标版本的 :sha-<commit>，重跑上线命令即可。
+#
+# 镜像来源：阿里云 ACR 的 **VPC 内网端点**（-vpc 前缀）。
+# 不要改成公网地址——VPC 端点走阿里云内网，不走公网、不消耗 3 Mbps 带宽、速度快得多。
+# 也不要用 GHCR：gitHubusercontent.com 在国内被阻断，docker pull 会卡死。
 
-x-deploy-image: &deploy_image ghcr.io/cdwenwang/daily_stock_analysis:prod
+x-deploy-image: &deploy_image crpi-u3rv49hccjew63jz-vpc.cn-beijing.personal.cr.aliyuncs.com/default-is/stock-analysis:prod
 
 services:
   analyzer:
