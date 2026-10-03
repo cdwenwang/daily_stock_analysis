@@ -270,6 +270,37 @@ git push origin main                    # 触发构建 → dsa-up
 - 部署类需求 → 放 `deploy/`（本 fork 独有目录）
 - 新功能 → 新增文件而不是改现有文件
 
+### 4.4 改配置（通知渠道、密钥、自选股）
+
+**两个必须记住的点：**
+
+**① 用 `dsa-up`，不要用 `docker compose restart`**
+
+`restart` 只是重启现有容器，**容器环境变量在创建时就固定了**，改 `.env` 不会生效。只有 `up -d`（`dsa-up` 内部就是这个）会重建容器并重新读取 `env_file`。
+
+这个坑实际踩过一次：把通知渠道从企业微信改成钉钉后执行 `restart`，诊断仍显示「已配置渠道: 2 个 / 企业微信, 钉钉」——旧渠道的环境变量还留在容器里。改用 `dsa-up` 后正常。
+
+**② 配置有两份，都要改**
+
+| 文件 | 作用 | 改动何时生效 |
+| --- | --- | --- |
+| `.env` | compose 通过 `env_file` 注入容器环境变量 | 需要 `dsa-up` 重建容器 |
+| `data/runtime.env` | 应用运行时读取的活跃配置（`ENV_FILE` 指向它），WebUI 保存也写这里 | 重启进程即可 |
+
+两份不一致时，`.env` 的环境变量优先（少数键除外，见 `src/config.py` 的 `_WEBUI_RUNTIME_ENV_FILE_PRIORITY_KEYS`）。所以**改配置时两份一起改**。
+
+**改完验证：**
+
+```bash
+dsa-up
+docker compose -f docker/docker-compose.yml -f deploy/docker-compose.prod.yml \
+  exec -T -u dsa server python main.py --check-notify
+```
+
+> 注意 `exec` 后面跟的是**服务名** `server`，不是容器名 `stock-server`——写容器名会报 `service "stock-server" is not running`。
+
+通知相关键（`DINGTALK_WEBHOOK_URL`、`WECHAT_WEBHOOK_URL`、`FEISHU_WEBHOOK_URL` 等）见 `docs/notifications.md`。
+
 ---
 
 ## 5. 备份
